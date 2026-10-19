@@ -1,0 +1,336 @@
+import shutil
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import speech_recognition as sr
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("pseg_auth_server")
+
+PROFILE_DIR = os.environ.get("PSEG_PROFILE_DIR", "/data/browser_data")
+PORT = int(os.environ.get("PORT", 8000))
+
+active_driver = None
+
+def solve_recaptcha_if_present(driver):
+    time.sleep(2)
+    bframes = [f for f in driver.find_elements(By.TAG_NAME, 'iframe') if 'bframe' in (f.get_attribute('src') or '')]
+    if not bframes:
+        return
+    logger.info("reCAPTCHA detected. Solving via audio challenge...")
+    driver.switch_to.frame(bframes[0])
+    try:
+        audio_btn = driver.find_elements(By.ID, 'recaptcha-audio-button')
+        if not audio_btn:
+            raise Exception("recaptcha_blocked: Audio challenge button not available")
+        audio_btn[0].click()
+        time.sleep(3)
+
+        body_text = driver.find_element(By.TAG_NAME, 'body').text
+        if "automated queries" in body_text.lower() or "try again later" in body_text.lower():
+            raise Exception("recaptcha_blocked: Google flagged automated queries and blocked audio challenge")
+
+        audio_sources = driver.find_elements(By.ID, 'audio-source')
+        if not audio_sources:
+            raise Exception("recaptcha_blocked: Unable to locate audio-source (challenge throttled by Google)")
+
+        src = audio_sources[0].get_attribute('src')
+        if not src:
+            raise Exception("recaptcha_blocked: audio-source src is empty")
+
+        urllib.request.urlretrieve(src, '/tmp/recaptcha.mp3')
+        subprocess.run(['ffmpeg', '-y', '-i', '/tmp/recaptcha.mp3', '/tmp/recaptcha.wav'], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        r = sr.Recognizer()
+        with sr.AudioFile('/tmp/recaptcha.wav') as source:
+            audio = r.record(source)
+        text = r.recognize_google(audio)
+        logger.info("Audio transcribed: '%s'", text)
+        
+        inp = driver.find_element(By.ID, 'audio-response')
+        inp.send_keys(text)
+        time.sleep(1)
+        driver.find_element(By.ID, 'recaptcha-verify-button').click()
+        time.sleep(3)
+    finally:
+        driver.switch_to.default_content()
+
+def init_driver():
+    os.makedirs(PROFILE_DIR, exist_ok=True)
+    opts = Options()
+    opts.add_argument('--headless=new')
+    opts.add_argument('--no-sandbox')
+    opts.add_argument('--disable-dev-shm-usage')
+    opts.add_argument('--disable-gpu')
+    opts.add_argument('--window-size=1280,800')
+    opts.add_argument(f'--user-data-dir={PROFILE_DIR}')
+    opts.add_argument('--disable-blink-features=AutomationControlled')
+    opts.add_experimental_option('excludeSwitches', ['enable-automation'])
+    opts.add_experimental_option('useAutomationExtension', False)
+    opts.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+    chrome_bin = (
+        shutil.which("chromium-browser")
+        or shutil.which("chromium")
+        or "/usr/bin/chromium-browser"
+    )
+    opts.binary_location = chrome_bin
+
+    chromedriver_bin = shutil.which("chromedriver") or "/usr/bin/chromedriver"
+    service = Service(chromedriver_bin)
+
+    d = webdriver.Chrome(service=service, options=opts)
+    d.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {
+        'source': 'Object.defineProperty(navigator, "webdriver", {get: () => undefined});'
+    })
+    return d
+
+class PsegAuthHandler(BaseHTTPRequestHandler):
+    def _send_json(self, status, payload):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.end_headers()
+        self.wfile.write(json.dumps(payload).encode('utf-8'))
+
+    def do_GET(self):
+        if self.path == '/health':
+            self._send_json(200, {"status": "healthy", "service": "pseg_auth_server"})
+        else:
+            self._send_json(404, {"error": "Not found"})
+
+    def do_POST(self):
+        global active_driver
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length).decode('utf-8')
+        try:
+            data = json.loads(body) if body else {}
+        except Exception:
+            data = {}
+
+        if self.path == '/login':
+            username = data.get('username')
+            password = data.get('password')
+            mfa_method = data.get('mfa_method', 'sms').lower()
+            dispatch_mfa = data.get('dispatch_mfa', False)
+
+            if not username or not password:
+                self._send_json(400, {"error": "username and password required"})
+                return
+
+            if active_driver:
+                try:
+                    active_driver.quit()
+                except Exception:
+                    pass
+                active_driver = None
+
+            try:
+                logger.info(
+                    "Starting login for user %s with MFA %s (dispatch_mfa=%s)...",
+                    username,
+                    mfa_method,
+                    dispatch_mfa,
+                )
+                driver = init_driver()
+                active_driver = driver
+
+                driver.get("https://mysmartenergy.nj.pseg.com/Saml/okta-prod/SignIn")
+                time.sleep(4)
+
+                # Enter username
+                user_inputs = driver.find_elements(By.CSS_SELECTOR, "input[name='identifier']")
+                if user_inputs:
+                    user_inputs[0].clear()
+                    user_inputs[0].send_keys(username)
+                    time.sleep(1)
+                    user_inputs[0].send_keys(Keys.ENTER)
+                    time.sleep(4)
+                    solve_recaptcha_if_present(driver)
+
+                # Enter password
+                for _ in range(15):
+                    pass_inputs = driver.find_elements(By.CSS_SELECTOR, "input[name='credentials.passcode']")
+                    if pass_inputs:
+                        break
+                    time.sleep(1)
+                else:
+                    raise Exception("Password field not found")
+
+                pass_inputs[0].send_keys(password)
+                time.sleep(1)
+                pass_inputs[0].send_keys(Keys.ENTER)
+                time.sleep(6)
+
+                # Check if redirected directly
+                if "mysmartenergy.nj.pseg.com" in driver.current_url and "SignIn" not in driver.current_url:
+                    cookies = driver.get_cookies()
+                    cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies if 'pseg.com' in c.get('domain', '')])
+                    driver.quit()
+                    active_driver = None
+                    self._send_json(200, {"success": True, "cookies": cookie_str})
+                    return
+
+                # Check if MFA selection is presented
+                phone_btns = driver.find_elements(By.CSS_SELECTOR, "a[aria-label*='Select Phone'], button[aria-label*='Select Phone']")
+                email_btns = driver.find_elements(By.CSS_SELECTOR, "a[aria-label*='Select Email'], button[aria-label*='Select Email']")
+
+                if phone_btns or email_btns:
+                    if not dispatch_mfa:
+                        logger.info("MFA required, but dispatch_mfa=False (background poll). Closing session without sending code.")
+                        driver.quit()
+                        active_driver = None
+                        self._send_json(200, {"success": False, "mfa_required": True, "dispatched": False})
+                        return
+
+                    if mfa_method == 'email':
+                        if email_btns:
+                            logger.info("Selecting Email MFA...")
+                            email_btns[0].click()
+                            time.sleep(4)
+                        send_email_btns = driver.find_elements(
+                            By.CSS_SELECTOR,
+                            "input[value*='Send'], input[value*='send'], button[data-type='save'], button[type='submit'], input[type='submit'], a[aria-label*='Send']"
+                        )
+                        if send_email_btns:
+                            logger.info("Clicking Send Email button...")
+                            send_email_btns[0].click()
+                            time.sleep(4)
+                    elif phone_btns:
+                        logger.info("Selecting Phone MFA...")
+                        phone_btns[0].click()
+                        time.sleep(4)
+                        sms_btns = driver.find_elements(By.CSS_SELECTOR, "a[aria-label*='SMS'], button[aria-label*='SMS'], input[value*='SMS']")
+                        if sms_btns:
+                            sms_btns[0].click()
+                            time.sleep(4)
+
+                    logger.info("MFA dispatched! Waiting for code...")
+                    self._send_json(200, {"success": False, "mfa_required": True, "dispatched": True})
+                    return
+
+                # Check if already on passcode prompt
+                passcode_candidates = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "input[name='credentials.passcode'], input[type='tel'], input[name='passcode'], input[name='answer'], input[autocomplete='one-time-code']"
+                )
+                passcode_inputs = [inp for inp in passcode_candidates if inp.is_displayed() and inp.is_enabled()]
+                if passcode_inputs:
+                    if not dispatch_mfa:
+                        logger.info("MFA challenge active, but dispatch_mfa=False. Closing session without dispatch.")
+                        driver.quit()
+                        active_driver = None
+                        self._send_json(200, {"success": False, "mfa_required": True, "dispatched": False})
+                        return
+                    logger.info("MFA prompt ready. Waiting for code...")
+                    self._send_json(200, {"success": False, "mfa_required": True, "dispatched": True})
+                    return
+            except Exception as e:
+                logger.error("Login failed: %s", e)
+                err_msg = str(e)
+                if active_driver:
+                    try:
+                        active_driver.quit()
+                    except Exception:
+                        pass
+                    active_driver = None
+                if "recaptcha_blocked" in err_msg:
+                    try:
+                        shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+                        logger.info("Cleared browser profile after recaptcha_blocked detection")
+                    except Exception:
+                        pass
+                status_code = 403 if "recaptcha_blocked" in err_msg else 500
+                self._send_json(status_code, {
+                    "error": err_msg,
+                    "recaptcha_blocked": "recaptcha_blocked" in err_msg
+                })
+
+        elif self.path == '/login/mfa':
+            code = data.get('code', '').strip()
+            if not active_driver:
+                self._send_json(400, {"error": "No active login session. Call /login first."})
+                return
+            if not code:
+                self._send_json(400, {"error": "code required"})
+                return
+
+            try:
+                driver = active_driver
+                candidates = driver.find_elements(
+                    By.CSS_SELECTOR,
+                    "input[name='credentials.passcode'], input[type='tel'], input[name='passcode'], input[name='answer'], input[autocomplete='one-time-code']"
+                )
+                passcode_inputs = [inp for inp in candidates if inp.is_displayed() and inp.is_enabled()]
+                if not passcode_inputs:
+                    text_candidates = driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input[type='tel'], input:not([type='hidden'])")
+                    passcode_inputs = [inp for inp in text_candidates if inp.is_displayed() and inp.is_enabled()]
+
+                if not passcode_inputs:
+                    raise Exception("Visible OTP input field not found on page")
+
+                target_input = passcode_inputs[0]
+                logger.info("Entering code %s into visible OTP input...", code)
+                driver.execute_script("arguments[0].scrollIntoView(true);", target_input)
+                time.sleep(0.5)
+                try:
+                    target_input.clear()
+                except Exception:
+                    target_input.send_keys(Keys.CONTROL + "a", Keys.BACKSPACE)
+
+                target_input.send_keys(code)
+                time.sleep(1)
+                target_input.send_keys(Keys.ENTER)
+
+                # Also click submit/verify button if present
+                verify_btns = [
+                    b for b in driver.find_elements(
+                        By.CSS_SELECTOR,
+                        "input[value*='Verify'], button[data-type='save'], input[data-type='save'], button[type='submit'], input[type='submit']"
+                    )
+                    if b.is_displayed() and b.is_enabled()
+                ]
+                if verify_btns:
+                    try:
+                        verify_btns[0].click()
+                    except Exception:
+                        pass
+
+                for _ in range(25):
+                    time.sleep(1)
+                    if "mysmartenergy.nj.pseg.com" in driver.current_url and "SignIn" not in driver.current_url:
+                        logger.info("SAML redirect complete!")
+                        break
+                else:
+                    raise Exception("Timed out waiting for portal redirect after OTP")
+
+                cookies = driver.get_cookies()
+                cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies if 'pseg.com' in c.get('domain', '')])
+                driver.quit()
+                active_driver = None
+                self._send_json(200, {"success": True, "cookies": cookie_str})
+            except Exception as e:
+                logger.error("MFA completion failed: %s", e)
+                if active_driver:
+                    try:
+                        active_driver.quit()
+                    except Exception:
+                        pass
+                    active_driver = None
+                self._send_json(500, {"error": str(e)})
+        else:
+            self._send_json(404, {"error": "Not found"})
+
+if __name__ == '__main__':
+    logger.info("Starting PSEG Auth Server on port %d...", PORT)
+    server = HTTPServer(('0.0.0.0', PORT), PsegAuthHandler)
+    server.serve_forever()
