@@ -3,6 +3,7 @@ version: "1.0.0"
 slug: "pseg_auth"
 description: "Automated sign-in companion service for the Home Assistant PSE&G integration."
 url: "https://github.com/sidprax/ha-pseg-auth-addon"
+image: "ghcr.io/sidprax/ha-pseg-auth-{arch}"
 arch:
   - amd64
   - aarch64
