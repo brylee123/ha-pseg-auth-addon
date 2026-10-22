@@ -146,6 +146,17 @@ class PsegAuthHandler(BaseHTTPRequestHandler):
 
                 driver.get("https://mysmartenergy.nj.pseg.com/Saml/okta-prod/SignIn")
                 time.sleep(4)
+                logger.info("Page loaded. Current URL: %s (Title: %s)", driver.current_url, driver.title)
+
+                # Check if already authenticated and redirected directly
+                if "mysmartenergy.nj.pseg.com" in driver.current_url and "SignIn" not in driver.current_url:
+                    logger.info("Already authenticated! Capturing cookies directly.")
+                    cookies = driver.get_cookies()
+                    cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies if 'pseg.com' in c.get('domain', '')])
+                    driver.quit()
+                    active_driver = None
+                    self._send_json(200, {"success": True, "cookies": cookie_str})
+                    return
 
                 # Enter username
                 user_inputs = driver.find_elements(By.CSS_SELECTOR, "input[name='identifier']")
@@ -235,7 +246,8 @@ class PsegAuthHandler(BaseHTTPRequestHandler):
                     self._send_json(200, {"success": False, "mfa_required": True, "dispatched": True})
                     return
             except Exception as e:
-                logger.error("Login failed: %s", e)
+                curr_url = getattr(active_driver, 'current_url', 'unknown')
+                logger.error("Login failed at URL %s: %s", curr_url, e)
                 err_msg = str(e)
                 if active_driver:
                     try:
@@ -243,12 +255,11 @@ class PsegAuthHandler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                     active_driver = None
-                if "recaptcha_blocked" in err_msg:
-                    try:
-                        shutil.rmtree(PROFILE_DIR, ignore_errors=True)
-                        logger.info("Cleared browser profile after recaptcha_blocked detection")
-                    except Exception:
-                        pass
+                try:
+                    shutil.rmtree(PROFILE_DIR, ignore_errors=True)
+                    logger.info("Cleared browser profile after login failure")
+                except Exception:
+                    pass
                 status_code = 403 if "recaptcha_blocked" in err_msg else 500
                 self._send_json(status_code, {
                     "error": err_msg,
