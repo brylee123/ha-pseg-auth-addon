@@ -2,7 +2,11 @@
 
 Official Home Assistant Add-on repository for the [PSE&G Integration](https://github.com/sidprax/ha-pseg).
 
-Provides companion services to automate portal authentication, Google reCAPTCHA challenges, and one-time verification passcodes (SMS/Email OTP) for the PSE&G integration.
+Provides companion services to automate portal authentication, Google reCAPTCHA challenges, and session renewals for the PSE&G integration.
+
+Supports two automated modes:
+- **Direct MyMeter Account (Recommended)**: Logs into `mysmartenergy.nj.pseg.com` directly using an invited secondary user. Zero 2FA/SMS code required.
+- **Primary PSE&G Account**: Navigates Okta SSO with automated reCAPTCHA solving and one-time verification passcodes (SMS/Email OTP).
 
 ## Add-ons in this Repository
 

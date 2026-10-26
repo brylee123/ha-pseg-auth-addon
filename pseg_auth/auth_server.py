@@ -122,6 +122,7 @@ class PsegAuthHandler(BaseHTTPRequestHandler):
             password = data.get('password')
             mfa_method = data.get('mfa_method', 'sms').lower()
             dispatch_mfa = data.get('dispatch_mfa', False)
+            auth_type = data.get('auth_type', 'auto').lower()
 
             if not username or not password:
                 self._send_json(400, {"error": "username and password required"})
@@ -135,8 +136,77 @@ class PsegAuthHandler(BaseHTTPRequestHandler):
                 active_driver = None
 
             try:
+                # Direct MyMeter invited-user flow (No Okta, No 2FA OTP required)
+                if auth_type == 'mymeter':
+                    logger.info("Starting Direct MyMeter login for user %s (no 2FA required)...", username)
+                    driver = init_driver()
+                    active_driver = driver
+
+                    driver.get("https://mysmartenergy.nj.pseg.com/")
+                    time.sleep(3)
+                    logger.info("Page loaded. Current URL: %s (Title: %s)", driver.current_url, driver.title)
+
+                    # Check if already authenticated
+                    if "Dashboard" in driver.current_url or ("mysmartenergy.nj.pseg.com" in driver.current_url and "Login" not in driver.current_url and "SignIn" not in driver.current_url):
+                        logger.info("Already authenticated! Capturing cookies directly.")
+                        cookies = driver.get_cookies()
+                        cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies if 'pseg.com' in c.get('domain', '')])
+                        driver.quit()
+                        active_driver = None
+                        self._send_json(200, {"success": True, "cookies": cookie_str})
+                        return
+
+                    email_inputs = driver.find_elements(By.ID, "LoginEmail")
+                    pass_inputs = driver.find_elements(By.ID, "LoginPassword")
+                    if not email_inputs or not pass_inputs:
+                        raise Exception("MyMeter login inputs (#LoginEmail, #LoginPassword) not found on page")
+
+                    email_inputs[0].clear()
+                    email_inputs[0].send_keys(username)
+                    time.sleep(0.5)
+
+                    pass_inputs[0].clear()
+                    pass_inputs[0].send_keys(password)
+                    time.sleep(0.5)
+
+                    # Ensure 'Remember Me' is enabled for persistent cookies
+                    rem_inputs = driver.find_elements(By.ID, "RememberMe")
+                    if rem_inputs:
+                        try:
+                            if not rem_inputs[0].is_selected():
+                                rem_inputs[0].click()
+                        except Exception:
+                            driver.execute_script("arguments[0].checked = true;", rem_inputs[0])
+
+                    login_btn = driver.find_elements(By.CSS_SELECTOR, ".loginBtn")
+                    if login_btn:
+                        login_btn[0].click()
+                    time.sleep(4)
+
+                    solve_recaptcha_if_present(driver)
+
+                    # Wait up to 15 seconds for dashboard navigation
+                    for _ in range(15):
+                        if "Dashboard" in driver.current_url or ("mysmartenergy.nj.pseg.com" in driver.current_url and "Login" not in driver.current_url and "SignIn" not in driver.current_url):
+                            break
+                        time.sleep(1)
+
+                    cookies = driver.get_cookies()
+                    cookie_str = "; ".join([f"{c['name']}={c['value']}" for c in cookies if 'pseg.com' in c.get('domain', '')])
+                    if "MM_SID" in cookie_str:
+                        logger.info("MyMeter direct login successful! Cookies captured.")
+                        driver.quit()
+                        active_driver = None
+                        self._send_json(200, {"success": True, "cookies": cookie_str})
+                        return
+
+                    error_els = driver.find_elements(By.CSS_SELECTOR, ".error, [data-valmsg-for='LoginErrorMessage']")
+                    err_text = error_els[0].text if error_els and error_els[0].text else "MyMeter direct login failed"
+                    raise Exception(err_text)
+
+                # Standard PSE&G Okta SSO flow
                 logger.info(
-                    "Starting login for user %s with MFA %s (dispatch_mfa=%s)...",
+                    "Starting Okta SSO login for user %s with MFA %s (dispatch_mfa=%s)...",
                     username,
                     mfa_method,
                     dispatch_mfa,
